@@ -1,479 +1,368 @@
-#!/usr/bin/env bash
+#!/bin/ksh
+#
+# $OpenBSD$
+#
+# Xray-core installer for OpenBSD.
+# Strictly follows hier(7), bsd.own.mk and rc.d(8) standards.
+# Designed for doas/sudo + cron usage.
 
-set -euxo pipefail
+set -eu
+umask 022
 
-# The files installed by this script conform to the layout of the file system in the OpenBSD operating system:
-# https://man.openbsd.org/hier
+# ==================== CONFIGURATION (hier(7) compliant) ====================
+BIN_PATH="/usr/local/bin/xray"
+SHARE_PATH="/usr/local/share/xray"      # Architecture-independent geo assets
+CONF_DIR="/etc/xray"
+LOG_DIR="/var/log/xray"
+RC_SCRIPT="/etc/rc.d/xray"
+DAEMON_USER="_xray"
+# daemon_class is READ-ONLY in rc.subr — it is automatically derived from
+# the rc.d script name by searching login.conf(5) for a matching class.
+# We define it here only as a shell variable for use in setup_login_class().
+DAEMON_CLASS="xray"
+GITHUB_REPO="XTLS/Xray-core"
 
-# The URL of the script project is:
-# https://github.com/XTLS/openbsd-install-xray
+# Script operation flags
+QUIET=0
+FORCE=0
 
-# The URL of the script is:
-# https://raw.githubusercontent.com/XTLS/openbsd-install-xray/main/install-release.sh
+# ========================================================================
+# Sanity check: Ensure script is running with root privileges
+if [ "$(id -u)" -ne 0 ]; then
+    echo "error: This script requires root privileges. Please run using doas or sudo." >&2
+    exit 1
+fi
 
-# If the script executes incorrectly, go to:
-# https://github.com/XTLS/openbsd-install-xray/issues
+# OpenBSD native architecture detection for downloading the correct binary
+case $(uname -m) in
+    amd64)  XRAY_ARCH="64" ;;
+    i386)   XRAY_ARCH="32" ;;
+    arm64)  XRAY_ARCH="arm64-v8a" ;;
+    *)      echo "error: Architecture $(uname -m) is currently not supported by Xray releases." >&2; exit 1 ;;
+esac
 
-identify_the_operating_system_and_architecture() {
-    if [[ "$(uname)" == 'OpenBSD' ]]; then
-        case "$(arch -s)" in
-            'i386' | 'i686')
-                BIT='32'
-                ;;
-            'amd64' | 'x86_64')
-                BIT='64'
-                ;;
-            *)
-                echo "error: The architecture is not supported."
-                exit 1
-                ;;
-        esac
+# Cleanup function to remove temporary files upon script exit or interruption
+cleanup() {
+    [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+# Logging utilities
+log()   { [ "$QUIET" -eq 1 ] && logger -t xray-install -p user.info "$1" || echo "info: $1"; }
+error() { [ "$QUIET" -eq 1 ] && logger -t xray-install -p user.err "$1" || echo "error: $1" >&2; }
+
+# POSIX/OpenBSD compliant version comparison (workaround since there is no GNU sort -V)
+version_gt() {
+    local top
+    top=$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)
+    [ "$top" != "$1" ]
+}
+
+# Extracts the version number of the currently installed binary
+get_current_version() {
+    [ -x "$BIN_PATH" ] || { echo ""; return; }
+    "$BIN_PATH" version 2>/dev/null | head -n1 | awk '{print $2}' | tr -d 'v'
+}
+
+# Queries GitHub API for the latest release tag
+get_latest_version() {
+    ftp -V -o - "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null |
+        awk -F'"' '/"tag_name":/ {print $4}' | tr -d 'v'
+}
+
+# Creates a dedicated, unprivileged user for running the daemon securely
+create_daemon_user() {
+    if ! id -u "$DAEMON_USER" >/dev/null 2>&1; then
+        log "Creating dedicated system user '$DAEMON_USER' to isolate the daemon..."
+        useradd -s /sbin/nologin -d /var/empty -c "Xray Proxy Service" "$DAEMON_USER"
     else
-        echo "error: This operating system is not supported."
-        exit 1
+        log "System user '$DAEMON_USER' already exists, proceeding..."
     fi
 }
 
-judgment_parameters() {
-    if [[ "$#" -gt '0' ]]; then
-        case "$1" in
-            '--remove')
-                if [[ "$#" -gt '1' ]]; then
-                    echo 'error: Please enter the correct parameters.'
-                    exit 1
-                fi
-                REMOVE='1'
-                ;;
-            '--version')
-                if [[ "$#" -gt '2' ]] || [[ -z "$2" ]]; then
-                    echo 'error: Please specify the correct version.'
-                    exit 1
-                fi
-                VERSION="$2"
-                ;;
-            '-c' | '--check')
-                if [[ "$#" -gt '1' ]]; then
-                    echo 'error: Please enter the correct parameters.'
-                    exit 1
-                fi
-                CHECK='1'
-                ;;
-            '-f' | '--force')
-                if [[ "$#" -gt '1' ]]; then
-                    echo 'error: Please enter the correct parameters.'
-                    exit 1
-                fi
-                FORCE='1'
-                ;;
-            '-h' | '--help')
-                if [[ "$#" -gt '1' ]]; then
-                    echo 'error: Please enter the correct parameters.'
-                    exit 1
-                fi
-                HELP='1'
-                ;;
-            '-l' | '--local')
-                if [[ "$#" -gt '2' ]] || [[ -z "$2" ]]; then
-                    echo 'error: Please specify the correct local file.'
-                    exit 1
-                fi
-                LOCAL_FILE="$2"
-                LOCAL_INSTALL='1'
-                ;;
-            '-p' | '--proxy')
-                case "$2" in
-                    'http://'*)
-                        ;;
-                    'https://'*)
-                        ;;
-                    'socks4://'*)
-                        ;;
-                    'socks4a://'*)
-                        ;;
-                    'socks5://'*)
-                        ;;
-                    'socks5h://'*)
-                        ;;
-                    *)
-                        echo 'error: Please specify the correct proxy server address.'
-                        exit 1
-                        ;;
-                esac
-                PROXY="-x $2"
-                # Parameters available through a proxy server
-                if [[ "$#" -gt '2' ]]; then
-                    case "$3" in
-                        '--version')
-                            if [[ "$#" -gt '4' ]] || [[ -z "$4" ]]; then
-                                echo 'error: Please specify the correct version.'
-                                exit 1
-                            fi
-                            VERSION="$2"
-                            ;;
-                        '-c' | '--check')
-                            if [[ "$#" -gt '3' ]]; then
-                                echo 'error: Please enter the correct parameters.'
-                                exit 1
-                            fi
-                            CHECK='1'
-                            ;;
-                        '-f' | '--force')
-                            if [[ "$#" -gt '3' ]]; then
-                                echo 'error: Please enter the correct parameters.'
-                                exit 1
-                            fi
-                            FORCE='1'
-                            ;;
-                        *)
-                            echo "$0: unknown option -- -"
-                            exit 1
-                            ;;
-                    esac
-                fi
-                ;;
-            *)
-                echo "$0: unknown option -- -"
-                exit 1
-                ;;
-        esac
-    fi
-}
-
-install_software() {
-    COMPONENT="$1"
-    if [[ -n "$(command -v $COMPONENT)" ]]; then
+# Adds the xray login class to /etc/login.conf if not already present.
+# This is the correct way to set fd limits for rc.d daemons: rc.subr(8)
+# automatically sets daemon_class to match the rc.d script name when a
+# corresponding login class exists in login.conf(5). No manual daemon_class
+# assignment in the rc.d script is needed or correct.
+setup_login_class() {
+    if grep -q "^${DAEMON_CLASS}:" /etc/login.conf 2>/dev/null; then
+        log "Login class '${DAEMON_CLASS}' already exists in /etc/login.conf."
         return
     fi
-    pkg_add "$COMPONENT--"
-    if [[ "$?" -ne '0' ]]; then
-        echo "error: Installation of $COMPONENT failed, please check your network."
-        exit 1
-    fi
-    echo "info: $COMPONENT is installed."
+
+    log "Appending '${DAEMON_CLASS}' login class to /etc/login.conf for fd limit tuning..."
+    cat >> /etc/login.conf << EOF
+
+${DAEMON_CLASS}:\\
+        :openfiles-cur=4096:\\
+        :openfiles-max=8192:\\
+        :tc=daemon:
+EOF
+    cap_mkdb /etc/login.conf
+    log "Rebuilt /etc/login.conf database via cap_mkdb(8)."
 }
 
-version_number() {
-    case "$1" in
-        'v'*)
-            echo "$1"
-            ;;
-        *)
-            echo "v$1"
-            ;;
-    esac
+# Generates and installs the rc.d(8) service script.
+# Key correctness notes:
+#   - daemon_class is NOT set here; rc.subr sets it automatically from login.conf.
+#   - ${_bg} MUST be placed outside the quoted string passed to ${rcexec}.
+#     Inside quotes, it would be passed literally as arguments to the daemon
+#     instead of being interpreted as shell redirection + backgrounding by ksh.
+#   - rc_reload=NO because Xray does not support SIGHUP config reload.
+install_rc_script() {
+    log "Generating and installing OpenBSD rc.d(8) service script at $RC_SCRIPT..."
+    cat > "$RC_SCRIPT" << EOF
+#!/bin/ksh
+#
+# \$OpenBSD\$
+#
+# Xray-core daemon control script.
+# Auto-generated by install-xray.sh
+
+daemon="${BIN_PATH}"
+daemon_flags="run -confdir ${CONF_DIR}"
+daemon_user="${DAEMON_USER}"
+daemon_timeout="60"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_start() {
+	# XRAY_LOCATION_ASSET must be injected via env(1).
+	# \${_bg} is intentionally placed OUTSIDE the quoted argument string:
+	# inside quotes it would be passed as literal text to the daemon binary,
+	# not interpreted as shell redirection and backgrounding by ksh(1).
+	\${rcexec} "env XRAY_LOCATION_ASSET=${SHARE_PATH} \${daemon} \${daemon_flags}" \${_bg}
 }
 
-get_version() {
-    # 0: Install or update Xray.
-    # 1: Installed or no new version of Xray.
-    # 2: Install the specified version of Xray.
-    if [[ -z "$VERSION" ]]; then
-        # Determine the version number for Xray installed from a local file
-        if [[ -f '/usr/local/bin/xray' ]]; then
-            VERSION="$(/usr/local/bin/xray version)"
-            CURRENT_VERSION="$(version_number $(echo $VERSION | head -n 1 | awk -F ' ' '{print $2}'))"
-            if [[ "$LOCAL_INSTALL" -eq '1' ]]; then
-                RELEASE_VERSION="$CURRENT_VERSION"
-                return
-            fi
-        fi
-        # Get Xray release version number
-        TMP_FILE="$(mktemp)"
-        install_software curl
-        curl ${PROXY} -o "$TMP_FILE" https://api.github.com/repos/XTLS/Xray-core/releases/latest -s
-        if [[ "$?" -ne '0' ]]; then
-            rm "$TMP_FILE"
-            echo 'error: Failed to get release list, please check your network.'
-            exit 1
-        fi
-        RELEASE_LATEST="$(cat $TMP_FILE | sed 'y/,/\n/' | grep 'tag_name' | awk -F '"' '{print $4}')"
-        rm "$TMP_FILE"
-        RELEASE_VERSION="$(version_number $RELEASE_LATEST)"
-        # Compare Xray version numbers
-        if [[ "$RELEASE_VERSION" != "$CURRENT_VERSION" ]]; then
-            RELEASE_VERSIONSION_NUMBER="${RELEASE_VERSION#v}"
-            RELEASE_MAJOR_VERSION_NUMBER="${RELEASE_VERSIONSION_NUMBER%%.*}"
-            RELEASE_MINOR_VERSION_NUMBER="$(echo $RELEASE_VERSIONSION_NUMBER | awk -F '.' '{print $2}')"
-            RELEASE_MINIMUM_VERSION_NUMBER="${RELEASE_VERSIONSION_NUMBER##*.}"
-            CURRENT_VERSIONSION_NUMBER="$(echo ${CURRENT_VERSION#v} | sed 's/-.*//')"
-            CURRENT_MAJOR_VERSION_NUMBER="${CURRENT_VERSIONSION_NUMBER%%.*}"
-            CURRENT_MINOR_VERSION_NUMBER="$(echo $CURRENT_VERSIONSION_NUMBER | awk -F '.' '{print $2}')"
-            CURRENT_MINIMUM_VERSION_NUMBER="${CURRENT_VERSIONSION_NUMBER##*.}"
-            if [[ "$RELEASE_MAJOR_VERSION_NUMBER" -gt "$CURRENT_MAJOR_VERSION_NUMBER" ]]; then
-                return 0
-            elif [[ "$RELEASE_MAJOR_VERSION_NUMBER" -eq "$CURRENT_MAJOR_VERSION_NUMBER" ]]; then
-                if [[ "$RELEASE_MINOR_VERSION_NUMBER" -gt "$CURRENT_MINOR_VERSION_NUMBER" ]]; then
-                    return 0
-                elif [[ "$RELEASE_MINOR_VERSION_NUMBER" -eq "$CURRENT_MINOR_VERSION_NUMBER" ]]; then
-                    if [[ "$RELEASE_MINIMUM_VERSION_NUMBER" -gt "$CURRENT_MINIMUM_VERSION_NUMBER" ]]; then
-                        return 0
-                    else
-                        return 1
-                    fi
-                else
-                    return 1
-                fi
-            else
-                return 1
-            fi
-        elif [[ "$RELEASE_VERSION" == "$CURRENT_VERSION" ]]; then
-            return 1
-        fi
-    else
-        RELEASE_VERSION="$(version_number $VERSION)"
-        return 2
-    fi
-}
-
-download_xray() {
-    mkdir "$TMP_DIRECTORY"
-    DOWNLOAD_LINK="https://github.com/XTLS/Xray-core/releases/download/$RELEASE_VERSION/Xray-openbsd-$BIT.zip"
-    echo "Downloading Xray archive: $DOWNLOAD_LINK"
-    curl ${PROXY} -L -H 'Cache-Control: no-cache' -o "$ZIP_FILE" "$DOWNLOAD_LINK" -#
-    if [[ "$?" -ne '0' ]]; then
-        echo 'error: Download failed! Please check your network or try again.'
-        return 1
-    fi
-    echo "Downloading verification file for Xray archive: $DOWNLOAD_LINK.dgst"
-    curl ${PROXY} -L -H 'Cache-Control: no-cache' -o "$ZIP_FILE.dgst" "$DOWNLOAD_LINK.dgst" -#
-    if [[ "$?" -ne '0' ]]; then
-        echo 'error: Download failed! Please check your network or try again.'
-        return 1
-    fi
-    if [[ "$(cat $ZIP_FILE.dgst)" == 'Not Found' ]]; then
-        echo 'error: This version does not support verification. Please replace with another version.'
-        return 1
-    fi
-
-    # Verification of Xray archive
-    for LISTSUM in 'md5' 'sha1' 'sha256' 'sha512'; do
-        SUM="$($LISTSUM $ZIP_FILE | sed 's/.* //')"
-        CHECKSUM="$(grep ${LISTSUM^^} $ZIP_FILE.dgst | sed 's/.* //')"
-        if [[ "$SUM" != "$CHECKSUM" ]]; then
-            echo 'error: Check failed! Please check your network or try again.'
-            return 1
-        fi
-    done
-}
-
-decompression() {
-    unzip -q "$1" -d "$TMP_DIRECTORY"
-    if [[ "$?" -ne '0' ]]; then
-        echo 'error: Xray decompression failed.'
-        rm -r "$TMP_DIRECTORY"
-        echo "removed: $TMP_DIRECTORY"
-        exit 1
-    fi
-    echo "info: Extract the Xray package to $TMP_DIRECTORY and prepare it for installation."
-}
-
-install_file() {
-    NAME="$1"
-    if [[ "$NAME" == 'xray' ]]; then
-        install -m 755 -g bin "${TMP_DIRECTORY}$NAME" "/usr/local/bin/$NAME"
-    elif [[ "$NAME" == 'geoip.dat' ]] || [[ "$NAME" == 'geosite.dat' ]]; then
-        install -m 755 -g bin "${TMP_DIRECTORY}$NAME" "/usr/local/lib/xray/$NAME"
-    fi
+rc_cmd \$1
+EOF
+    chmod 555 "$RC_SCRIPT"
+    chown root:wheel "$RC_SCRIPT"
 }
 
 install_xray() {
-    # Install Xray binary to /usr/local/bin/ and /usr/local/lib/xray/
-    install_file xray
-    install -d /usr/local/lib/xray/
-    install_file geoip.dat
-    install_file geosite.dat
+    local version="$1"
 
-    # Install Xray configuration file to /etc/xray/
-    if [[ ! -d '/etc/xray/' ]]; then
-        install -d /etc/xray/
-        for BASE in 00_log 01_api 02_dns 03_routing 04_policy 05_inbounds 06_outbounds 07_transport 08_stats 09_reverse; do
-            echo '{}' > "/etc/xray/$BASE.json"
-        done
-        CONFDIR='1'
+    log "Starting Xray-core deployment process..."
+
+    if [ "$version" = "latest" ]; then
+        log "Querying GitHub for the latest release version..."
+        version=$(get_latest_version)
+        [ -z "$version" ] && { error "Failed to fetch the latest version tag from GitHub API."; exit 1; }
+        version="v${version}"
+    elif [ "${version#v}" = "$version" ]; then
+        version="v${version}"
     fi
 
-    # Used to store Xray log files
-    if [[ ! -d '/var/log/xray/' ]]; then
-        install -do www /var/log/xray/
-        LOG='1'
-    fi
-}
+    local current
+    current=$(get_current_version)
+    local target=${version#v}
 
-install_startup_service_file() {
-    if [[ ! -f '/etc/rc.d/xray' ]]; then
-        mkdir "${TMP_DIRECTORY}rc.d/"
-        install_software curl
-        curl ${PROXY} -o "${TMP_DIRECTORY}rc.d/xray" https://raw.githubusercontent.com/XTLS/openbsd-install-xray/main/rc.d/xray -s
-        if [[ "$?" -ne '0' ]]; then
-            echo 'error: Failed to start service file download! Please check your network or try again.'
-            exit 1
-        fi
-        install -m 755 -g bin "${TMP_DIRECTORY}rc.d/xray" /etc/rc.d/xray
-        RC_D='1'
+    if [ -n "$current" ] && [ "$current" = "$target" ] && [ "$FORCE" -eq 0 ]; then
+        log "Xray v${current} is already installed and matches the requested version."
+        [ "$QUIET" -eq 0 ] && echo "Hint: Use '$0 install --force' if you need to cleanly reinstall."
+        exit 0
     fi
-}
 
-start_xray() {
-    if [[ -f '/etc/rc.d/xray' ]]; then
-        rcctl start xray
-    fi
-    if [[ "$?" -ne 0 ]]; then
-        echo 'error: Failed to start Xray service.'
+    # ==================== DOWNLOAD & VERIFICATION ====================
+    TMP_DIR=$(mktemp -d /tmp/xray.XXXXXX)
+    local zip="${TMP_DIR}/xray.zip"
+    local dgst="${TMP_DIR}/xray.zip.dgst"
+
+    log "Downloading Xray release ${version} for architecture ${XRAY_ARCH}..."
+    ftp -V -o "$zip" "https://github.com/${GITHUB_REPO}/releases/download/${version}/Xray-openbsd-${XRAY_ARCH}.zip" \
+        || { error "Failed to download the Xray zip archive."; exit 1; }
+
+    log "Downloading SHA256 signature file..."
+    ftp -V -o "$dgst" "https://github.com/${GITHUB_REPO}/releases/download/${version}/Xray-openbsd-${XRAY_ARCH}.zip.dgst" \
+        || { error "Failed to download the .dgst signature file."; exit 1; }
+
+    log "Verifying package integrity via SHA256 checksum..."
+    local expected actual
+    expected=$(sed -n 's/.*256= *//p' "$dgst" | head -n1)
+    actual=$(sha256 -q "$zip")
+    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+        error "CRITICAL: SHA256 checksum verification failed! Archive might be corrupted or compromised."
         exit 1
     fi
-    echo 'info: Start the Xray service.'
-}
+    log "Checksum verification passed successfully."
 
-stop_xray() {
-    if [[ -f '/etc/rc.d/xray' ]]; then
-        rcctl stop xray
+    log "Extracting archive contents..."
+    unzip -q -o "$zip" -d "$TMP_DIR"
+
+    # ==================== DEPLOYMENT ====================
+    create_daemon_user
+    setup_login_class
+
+    log "Installing binary to $BIN_PATH..."
+    install -m 555 -o root -g bin "${TMP_DIR}/xray" "$BIN_PATH"
+
+    log "Deploying geo-assets to $SHARE_PATH..."
+    install -d -m 755 -o root -g bin "$SHARE_PATH"
+    install -m 644 -o root -g bin "${TMP_DIR}/geoip.dat" "${TMP_DIR}/geosite.dat" "$SHARE_PATH/"
+
+    log "Configuring directory permissions..."
+    # Config directory: root:_xray 750 — daemon reads, only root modifies
+    install -d -m 750 -o root -g "$DAEMON_USER" "$CONF_DIR"
+    chown -R root:"$DAEMON_USER" "$CONF_DIR"
+    find "$CONF_DIR" -name '*.json' -exec chmod 640 {} + 2>/dev/null || true
+
+    # Log directory: _xray:_xray 750 — daemon has full control over its logs
+    install -d -m 750 -o "$DAEMON_USER" -g "$DAEMON_USER" "$LOG_DIR"
+
+    install_rc_script
+
+    # ==================== FINAL SYSTEM MESSAGES ====================
+    if [ "$QUIET" -eq 0 ]; then
+        echo ""
+        echo "================================================================================"
+        echo " Xray-core ${version} has been deployed successfully!"
+        echo "--------------------------------------------------------------------------------"
+        echo "   Executable  : $BIN_PATH"
+        echo "   Geo Assets  : $SHARE_PATH/ (geoip.dat, geosite.dat)"
+        echo "   Configs     : $CONF_DIR/ (root:_xray, 640 on *.json)"
+        echo "   Logs        : $LOG_DIR/ (_xray:_xray 750)"
+        echo "   rc.d script : $RC_SCRIPT"
+        echo "   login class : ${DAEMON_CLASS} (openfiles 4096/8192, tc=daemon)"
+        echo ""
+        echo "   Enable service : doas rcctl enable xray"
+        echo "   Start service  : doas rcctl start xray"
+        echo "================================================================================"
+    else
+        logger -t xray-install -p user.notice "Successfully installed/updated Xray to ${version}"
     fi
-    if [[ "$?" -ne '0' ]]; then
-        echo 'error: Stopping the Xray service failed.'
-        exit 1
-    fi
-    echo 'info: Stop the Xray service.'
 }
 
 check_update() {
-    if [[ -f '/etc/rc.d/xray' ]]; then
-        get_version
-        if [[ "$?" -eq '0' ]]; then
-            echo "info: Found the latest release of Xray $RELEASE_VERSION . (Current release: $CURRENT_VERSION)"
-        elif [[ "$?" -eq '1' ]]; then
-            echo "info: No new version. The current version of Xray is $CURRENT_VERSION ."
-        fi
+    local current latest
+    current=$(get_current_version)
+    latest=$(get_latest_version)
+
+    [ -z "$latest" ] && { error "Failed to fetch latest version data."; exit 1; }
+
+    if [ -z "$current" ]; then
+        [ "$QUIET" -eq 0 ] && echo "Xray is currently not installed. The latest available release is: v${latest}"
         exit 0
+    fi
+
+    if version_gt "$latest" "$current"; then
+        [ "$QUIET" -eq 0 ] && echo "Update available! v${current} -> v${latest}"
+        return 0  # update available
     else
-        echo 'error: Xray is not installed.'
+        [ "$QUIET" -eq 0 ] && echo "Your Xray installation is fully up to date (v${current})."
+        return 1  # already up to date
+    fi
+}
+
+uninstall_xray() {
+    local purge=${1:-0}
+    log "Initiating Xray-core removal procedure..."
+
+    # Gracefully stop and disable the service before removing files
+    rcctl stop xray 2>/dev/null || true
+    rcctl disable xray 2>/dev/null || true
+
+    for p in "$BIN_PATH" "$SHARE_PATH" "$RC_SCRIPT"; do
+        [ -e "$p" ] && rm -rf "$p" && log "Deleted system path: $p"
+    done
+
+    if [ "$purge" = 1 ]; then
+        rm -rf "$CONF_DIR" "$LOG_DIR" 2>/dev/null || true
+        log "Purged configuration directory: $CONF_DIR"
+        log "Purged log directory: $LOG_DIR"
+
+        if id -u "$DAEMON_USER" >/dev/null 2>&1; then
+            userdel "$DAEMON_USER" 2>/dev/null || true
+            log "Deleted system user: $DAEMON_USER"
+        fi
+    else
+        echo "warning: User configurations ($CONF_DIR) and logs ($LOG_DIR) were preserved."
+        echo "         To completely obliterate all traces, run: '$0 remove --purge'"
+    fi
+
+    log "Xray-core removal completed."
+}
+
+print_help() {
+    cat << EOF
+Usage: $0 <command> [options]
+
+Commands:
+  install [version]     Install or upgrade Xray-core (defaults to the latest release)
+  check                 Check GitHub for available updates
+  update                Silent auto-update if a newer version is available
+  remove [--purge]      Uninstall Xray-core
+  help                  Display this comprehensive help message
+
+Options:
+  --force, -f           Force reinstallation even if the exact version is already installed
+  --quiet, -q           Enable quiet mode (suppresses stdout, logs to syslog; ideal for cron jobs)
+  --purge               Obliterate configs, logs, and the dedicated user (only valid with 'remove')
+
+Examples:
+  doas $0 install
+  doas $0 install v1.8.4
+  0 4 * * * doas $0 update --quiet   # Recommended cron job schedule for automatic updates
+EOF
+}
+
+# ====================== ARGUMENT PARSING & MAIN EXECUTION ======================
+COMMAND="install"
+VERSION="latest"
+PURGE=0
+
+# Determine primary command
+if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+    COMMAND="$1"
+    shift
+fi
+
+# Parse additional runtime options
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --quiet|-q) QUIET=1; shift ;;
+        --force|-f) FORCE=1; shift ;;
+        --purge)    PURGE=1; shift ;;
+        -*)         error "Unrecognized option '$1' provided."; print_help >&2; exit 1 ;;
+        *)          VERSION="$1"; shift ;;
+    esac
+done
+
+# Route to the appropriate function based on the requested command
+case "$COMMAND" in
+    install)
+        if ! command -v unzip >/dev/null 2>&1; then
+            log "Dependency 'unzip' is missing. Installing via pkg_add..."
+            pkg_add -I unzip || { error "Failed to install required dependency: unzip."; exit 1; }
+        fi
+        install_xray "$VERSION"
+        ;;
+    check)
+        check_update
+        ;;
+    update)
+        # check_update now returns 0 if update available, 1 if already current.
+        # This fixes the previous logic where check_update always returned 0.
+        QUIET=1
+        if check_update; then
+            log "Auto-update triggered via cron/manual execution."
+            install_xray latest
+            rcctl restart xray 2>/dev/null || true
+        fi
+        ;;
+    remove)
+        uninstall_xray "$PURGE"
+        ;;
+    help)
+        print_help
+        ;;
+    *)
+        error "Unknown command '$COMMAND' requested."
+        print_help >&2
         exit 1
-    fi
-}
-
-remove_xray() {
-    if [[ -f '/etc/rc.d/xray' ]]; then
-        if [[ -n "$(pgrep xray)" ]]; then
-            stop_xray
-        fi
-        NAME="$1"
-        rm /usr/local/bin/xray
-        rm -r /usr/local/lib/xray/
-        rm /etc/rc.d/xray
-        if [[ "$?" -ne '0' ]]; then
-            echo 'error: Failed to remove Xray.'
-            exit 1
-        else
-            echo 'removed: /usr/local/bin/xray'
-            echo 'removed: /usr/local/lib/xray/'
-            echo 'removed: /etc/rc.d/xray'
-            echo 'Please execute the command: rcctl disable xray'
-            echo 'You may need to execute a command to remove dependent software: pkg_delete -c bash curl unzip; pkg_delete -ac'
-            echo 'info: Xray has been removed.'
-            echo 'info: If necessary, manually delete the configuration and log files.'
-            echo 'info: e.g., /etc/xray/ and /var/log/xray/ ...'
-            exit 0
-        fi
-    else
-        echo 'error: Xray is not installed.'
-        exit 1
-    fi
-}
-
-# Explanation of parameters in the script
-show_help() {
-    echo "usage: $0 [--remove | --version number | -c | -f | -h | -l | -p]"
-    echo '  [-p address] [--version number | -c | -f]'
-    echo '  --remove        Remove Xray'
-    echo '  --version       Install the specified version of Xray, e.g., --version v1.4.2'
-    echo '  -c, --check     Check if Xray can be updated'
-    echo '  -f, --force     Force installation of the latest version of Xray'
-    echo '  -h, --help      Show help'
-    echo '  -l, --local     Install Xray from a local file'
-    echo '  -p, --proxy     Download through a proxy server, e.g., -p http://127.0.0.1:8118 or -p socks5://127.0.0.1:1080'
-    exit 0
-}
-
-main() {
-    identify_the_operating_system_and_architecture
-    judgment_parameters "$@"
-
-    # Parameter information
-    [[ "$HELP" -eq '1' ]] && show_help
-    [[ "$CHECK" -eq '1' ]] && check_update
-    [[ "$REMOVE" -eq '1' ]] && remove_xray
-
-    # Two very important variables
-    TMP_DIRECTORY="$(mktemp -du)/"
-    ZIP_FILE="${TMP_DIRECTORY}Xray-openbsd-$BIT.zip"
-
-    # Install Xray from a local file, but still need to make sure the network is available
-    if [[ "$LOCAL_INSTALL" -eq '1' ]]; then
-        echo 'warn: Install Xray from a local file, but still need to make sure the network is available.'
-        echo -n 'warn: Please make sure the file is valid because we cannot confirm it. (Press any key) ...'
-        read
-        install_software unzip
-        mkdir "$TMP_DIRECTORY"
-        decompression "$LOCAL_FILE"
-    else
-        # Normal way
-        get_version
-        NUMBER="$?"
-        if [[ "$NUMBER" -eq '0' ]] || [[ "$FORCE" -eq '1' ]] || [[ "$NUMBER" -eq 2 ]]; then
-            echo "info: Installing Xray $RELEASE_VERSION for $(arch -s)"
-            download_xray
-            if [[ "$?" -eq '1' ]]; then
-                rm -r "$TMP_DIRECTORY"
-                echo "removed: $TMP_DIRECTORY"
-                exit 0
-            fi
-            install_software unzip
-            decompression "$ZIP_FILE"
-        elif [[ "$NUMBER" -eq '1' ]]; then
-            echo "info: No new version. The current version of Xray is $CURRENT_VERSION ."
-            exit 0
-        fi
-    fi
-
-    # Determine if Xray is running
-    if [[ -n "$(pgrep xray)" ]]; then
-        stop_xray
-        XRAY_RUNNING='1'
-    fi
-    install_xray
-    install_startup_service_file
-    echo 'installed: /usr/local/bin/xray'
-    echo 'installed: /usr/local/lib/xray/geoip.dat'
-    echo 'installed: /usr/local/lib/xray/geosite.dat'
-    if [[ "$CONFDIR" -eq '1' ]]; then
-        echo 'installed: /etc/xray/00_log.json'
-        echo 'installed: /etc/xray/01_api.json'
-        echo 'installed: /etc/xray/02_dns.json'
-        echo 'installed: /etc/xray/03_routing.json'
-        echo 'installed: /etc/xray/04_policy.json'
-        echo 'installed: /etc/xray/05_inbounds.json'
-        echo 'installed: /etc/xray/06_outbounds.json'
-        echo 'installed: /etc/xray/07_transport.json'
-        echo 'installed: /etc/xray/08_stats.json'
-        echo 'installed: /etc/xray/09_reverse.json'
-    fi
-    if [[ "$LOG" -eq '1' ]]; then
-        echo 'installed: /var/log/xray/'
-    fi
-    if [[ "$RC_D" -eq '1'  ]]; then
-        echo 'installed: /etc/rc.d/xray'
-    fi
-    rm -r "$TMP_DIRECTORY"
-    echo "removed: $TMP_DIRECTORY"
-    if [[ "$LOCAL_INSTALL" -eq '1' ]]; then
-        get_version
-    fi
-    echo "info: Xray $RELEASE_VERSION is installed."
-    echo 'You may need to execute a command to remove dependent software: pkg_delete -c bash curl unzip; pkg_delete -ac'
-    if [[ "$XRAY_RUNNING" -eq '1' ]]; then
-        start_xray
-    else
-        echo 'Please execute the command: rcctl enable xray; rcctl start xray'
-    fi
-}
-
-main "$@"
+        ;;
+esac
